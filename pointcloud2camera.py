@@ -23,7 +23,13 @@ from scipy.spatial import cKDTree
 from sklearn.cluster import DBSCAN
 from sklearn import metrics
 from sklearn.datasets import make_blobs
-
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+IM_HEIGHT = 1080
+IM_WIDTH = 1920
+PLT_IMG_HANDLER = None
+PLT_IMG_AX = None
+CURRENT_CAM_IMG = None
 try:
     sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
         sys.version_info.major,
@@ -39,6 +45,26 @@ def transform_polar (points):
     rho = np.sqrt(x**2 + y**2)
     phi = np.degrees(np.arctan2(y,x))
     return np.vstack((rho, phi)).T
+def processImg(image):
+    print('processing image')
+    global CURRENT_CAM_IMG
+    i = np.array(image.raw_data)
+    i = i.reshape((IM_HEIGHT, IM_WIDTH, 4))
+    i = i[:, :, :3]
+    CURRENT_CAM_IMG = i
+    # image.save_to_disk('image.png')
+    return i/255.0
+def imgUpdate(i):
+  global PLT_IMG_HANDLER
+  # print (vehicles)
+  if not CURRENT_CAM_IMG:
+    plt.imshow((IM_HEIGHT, IM_WIDTH, 3))
+    return
+  if not PLT_IMG_HANDLER:
+    PLT_IMG_HANDLER = plt.imshow(CURRENT_CAM_IMG)
+    #plt.show()
+  else:
+    PLT_IMG_HANDLER.set_data(CURRENT_CAM_IMG)
 
 def lidar_callback(point_cloud, buf, background_data):
     """Prepares a point cloud with intensity colors and stores in a buffer, which updated the mayavi visualisation"""
@@ -72,13 +98,12 @@ def lidar_callback(point_cloud, buf, background_data):
     polar_points = transform_polar(filtered_points)
     polar_points = np.append(polar_points,np.expand_dims(filtered_points[:,2], axis=1), 1)
     polar_points[:, 1] *= 0.05
-    polar_points[:, 2] *= 0.6
     if points[filtermask].shape[0] > 0:
-        # clusters = DBSCAN(eps=0.5, min_samples=3).fit(filtered_points)
-        clusters = DBSCAN(eps=0.7, min_samples=3).fit(polar_points)
+        clusters = DBSCAN(eps=0.5, min_samples=3).fit(filtered_points)
+        # clusters = DBSCAN(eps=0.7, min_samples=3).fit(polar_points)
         labels = clusters.labels_
-        # buf['pts'] = filtered_points
-        buf['pts'] = polar_points
+        buf['pts'] = filtered_points
+        # buf['pts'] = polar_points
         buf['intensity'] = labels
     else:
         buf['pts'] = np.array([[0,0,0]])
@@ -179,6 +204,16 @@ def main(arg):
         # vehicle = world.spawn_actor(vehicle_bp, vehicle_transform)
         # vehicle.set_autopilot(arg.no_autopilot)
 
+        camera_bp = world.get_blueprint_library().find('sensor.camera.rgb')
+        camera_bp.set_attribute('image_size_x', str(IM_WIDTH))
+        camera_bp.set_attribute('image_size_y', str(IM_HEIGHT))
+        camera_bp.set_attribute('fov', '110')
+        camera_transform = carla.Transform(carla.Location(x=-65.0, y=3.0, z=6.0), carla.Rotation(yaw=180.0, pitch=-30.0))
+        camera = world.spawn_actor(camera_bp, camera_transform)
+        camera.listen(processImg)
+        _, PLT_IMG_AX = plt.subplots(1)
+        # ani = FuncAnimation(plt.gcf(), imgUpdate, interval=50)
+        # plt.show()
         lidar_bp = generate_lidar_bp(arg, world, blueprint_library, delta)
         lidar_transform = carla.Transform(carla.Location(x=-65.0, y=3.0, z=6.0))
         lidar = world.spawn_actor(lidar_bp, lidar_transform)
