@@ -6,30 +6,14 @@
 # This work is licensed under the terms of the MIT license.
 # For a copy, see <https://opensource.org/licenses/MIT>.
 
-"""Mayavi Lidar visualization example for CARLA"""
+"""
+Lidar projection on RGB camera example
+"""
 
 import glob
 import os
 import sys
-import argparse
-import time
-from datetime import datetime
-import random
-import threading
-import numpy as np
-from matplotlib import cm
-from mayavi import mlab
-from scipy.spatial import cKDTree
-from sklearn.cluster import DBSCAN
-from sklearn import metrics
-from sklearn.datasets import make_blobs
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-IM_HEIGHT = 1080
-IM_WIDTH = 1920
-PLT_IMG_HANDLER = None
-PLT_IMG_AX = None
-CURRENT_CAM_IMG = None
+
 try:
     sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
         sys.version_info.major,
@@ -39,115 +23,38 @@ except IndexError:
     pass
 
 import carla
-def transform_polar (points):
-    x = points[:, 0]
-    y = points[:, 1]
-    rho = np.sqrt(x**2 + y**2)
-    phi = np.degrees(np.arctan2(y,x))
-    return np.vstack((rho, phi)).T
-def processImg(image):
-    print('processing image')
-    global CURRENT_CAM_IMG
-    i = np.array(image.raw_data)
-    i = i.reshape((IM_HEIGHT, IM_WIDTH, 4))
-    i = i[:, :, :3]
-    CURRENT_CAM_IMG = i
-    # image.save_to_disk('image.png')
-    return i/255.0
-def imgUpdate(i):
-  global PLT_IMG_HANDLER
-  # print (vehicles)
-  if not CURRENT_CAM_IMG:
-    plt.imshow((IM_HEIGHT, IM_WIDTH, 3))
-    return
-  if not PLT_IMG_HANDLER:
-    PLT_IMG_HANDLER = plt.imshow(CURRENT_CAM_IMG)
-    #plt.show()
-  else:
-    PLT_IMG_HANDLER.set_data(CURRENT_CAM_IMG)
 
-def lidar_callback(point_cloud, buf, background_data):
-    """Prepares a point cloud with intensity colors and stores in a buffer, which updated the mayavi visualisation"""
-    data = np.copy(np.frombuffer(point_cloud.raw_data, dtype=np.dtype('f4')))
-    data = np.reshape(data, (int(data.shape[0] / 4), 4))
+import argparse
+from queue import Queue
+from queue import Empty
+from matplotlib import cm
+from scipy.spatial import cKDTree
+from sklearn.cluster import DBSCAN
 
-    # Isolate the intensity and compute a color for it
-    intensity = data[:, -1]
-    intensity_col = 1.0 - np.log(intensity) / np.log(np.exp(-0.004 * 100))
+try:
+    import numpy as np
+except ImportError:
+    raise RuntimeError('cannot import numpy, make sure numpy package is installed')
 
-    # Isolate the 3D data
-    points = data[:, :-1]
+try:
+    from PIL import Image
+except ImportError:
+    raise RuntimeError('cannot import PIL, make sure "Pillow" package is installed')
 
-    # We're negating the y to correclty visualize a world that matches
-    # what we see in Unreal since Mayavi uses a right-handed coordinate system
-    points[:, :1] = -points[:, :1]
-    d, i = background_data.query(points)
-    filtermask = d > 0.2
-
-    # # An example of converting points from sensor to vehicle space if we had
-    # # a carla.Transform variable named "tran":
-    # points = np.append(points, np.ones((points.shape[0], 1)), axis=1)
-    # points = np.dot(tran.get_matrix(), points.T).T
-    # points = points[:, :-1]
-
-    #copy points/intensities into buffer
-    # print(points[filtermask].shape)
-    filtered_points = points[filtermask]
-    
-    # print (filtered_points[:, :-1])
-    polar_points = transform_polar(filtered_points)
-    polar_points = np.append(polar_points,np.expand_dims(filtered_points[:,2], axis=1), 1)
-    polar_points[:, 1] *= 0.05
-    if points[filtermask].shape[0] > 0:
-        clusters = DBSCAN(eps=0.5, min_samples=3).fit(filtered_points)
-        # clusters = DBSCAN(eps=0.7, min_samples=3).fit(polar_points)
-        labels = clusters.labels_
-        buf['pts'] = filtered_points
-        # buf['pts'] = polar_points
-        buf['intensity'] = labels
-    else:
-        buf['pts'] = np.array([[0,0,0]])
-        buf['intensity'] = np.array([0.9])
-    # buf['pts'] = points
-    # buf['intensity'] = intensity
-    # np.savetxt("background.csv", points, delimiter=",")
-
-def semantic_lidar_callback(point_cloud, buf, background_data):
-    """Prepares a point cloud with semantic segmentation colors"""
-    data = np.frombuffer(point_cloud.raw_data, dtype=np.dtype([
-        ('x', np.float32), ('y', np.float32), ('z', np.float32),
-        ('CosAngle', np.float32), ('ObjIdx', np.uint32), ('ObjTag', np.uint32)]))
-
-    # We're negating the y to correclty visualize a world that matches
-    # what we see in Unreal since Open3D uses a right-handed coordinate system
-    points = np.array([data['x'], -data['y'], data['z']]).T
-
-    # # An example of adding some noise to our data if needed:
-    # points += np.random.uniform(-0.05, 0.05, size=points.shape)
-
-    # Colorize the pointcloud based on the CityScapes color palette
-    labels = np.array(data['ObjTag'], dtype=np.float32)
-    int_color = labels
-
-    # # In case you want to make the color intensity depending
-    # # of the incident ray angle, you can use:
-    #  int_color *= np.array(data['CosAngle'])
-    
-    buf['pts'] = points
-    buf['intensity'] = labels
+VIRIDIS = np.array(cm.get_cmap('viridis').colors)
+VID_RANGE = np.linspace(0.0, 1.0, VIRIDIS.shape[0])
+original_settings = None
+delta = 0.05
 
 def generate_lidar_bp(arg, world, blueprint_library, delta):
     """Generates a CARLA blueprint based on the script parameters"""
-    if arg.semantic:
-        lidar_bp = world.get_blueprint_library().find('sensor.lidar.ray_cast_semantic')
-    else:
-        lidar_bp = blueprint_library.find('sensor.lidar.ray_cast')
-        if arg.no_noise:
-            lidar_bp.set_attribute('dropoff_general_rate', '0.0')
-            lidar_bp.set_attribute('dropoff_intensity_limit', '1.0')
-            lidar_bp.set_attribute('dropoff_zero_intensity', '0.0')
-        else:
-            lidar_bp.set_attribute('noise_stddev', '0.05')
+    lidar_bp = blueprint_library.find('sensor.lidar.ray_cast')
+    # if arg.no_noise:
+    lidar_bp.set_attribute('dropoff_general_rate', '0.0')
+    lidar_bp.set_attribute('dropoff_intensity_limit', '1.0')
+    lidar_bp.set_attribute('dropoff_zero_intensity', '0.0')
+    # else:
+    #     lidar_bp.set_attribute('noise_stddev', '0.05')
 
     lidar_bp.set_attribute('upper_fov', str(arg.upper_fov))
     lidar_bp.set_attribute('lower_fov', str(arg.lower_fov))
@@ -157,183 +64,315 @@ def generate_lidar_bp(arg, world, blueprint_library, delta):
     lidar_bp.set_attribute('points_per_second', str(arg.points_per_second))
     return lidar_bp
 
-def carlaEventLoop(world):
-    frame = 0
-    dt0 = datetime.now()
-    while True:
-        time.sleep(0.005)
-        world.tick()
+def generate_camera_bp(arg, blueprint_library):
+    camera_bp = blueprint_library.filter("sensor.camera.rgb")[0]
+    camera_bp.set_attribute("image_size_x", str(arg.width))
+    camera_bp.set_attribute("image_size_y", str(arg.height))
+    camera_bp.set_attribute('fov', '110')
+    return camera_bp
 
-        process_time = datetime.now() - dt0
-        sys.stdout.write('\r' + 'FPS: ' + str(1.0 / process_time.total_seconds()))
-        sys.stdout.flush()
-        dt0 = datetime.now()
-        frame += 1
+def sensor_callback(data, queue):
+    """
+    This simple callback just stores the data on a thread safe Python Queue
+    to be retrieved from the "main thread".
+    """
+    queue.put(data)
 
+def setup_world(args):
+    global original_settings
+    client = carla.Client(args.host, args.port)
+    client.set_timeout(2.0)
+    client.load_world('town05')
+    world = client.get_world()
+    bp_lib = world.get_blueprint_library()
+    original_settings = world.get_settings()
+    settings = world.get_settings()
+    settings.synchronous_mode = True
+    settings.fixed_delta_seconds = delta
+    world.apply_settings(settings)
+    lidar_bp = generate_lidar_bp(args, world, bp_lib, delta)
+    lidar_transform = carla.Transform(carla.Location(x=-65.0, y=3.0, z=6.0))
+    lidar = world.spawn_actor(
+        blueprint=lidar_bp,
+        transform=lidar_transform)
+    camera_bp = generate_camera_bp(args, bp_lib)
+    camera_transform = transform = carla.Transform(carla.Location(x=-65.0, y=3.0, z=6.0), carla.Rotation(yaw=180.0, pitch=-30.0))
+    camera = world.spawn_actor(
+        blueprint=camera_bp,
+        transform=camera_transform)
+    return client, camera, lidar, camera_bp, lidar_bp, world
+def transform_polar (points):
+    x = points[:, 0]
+    y = points[:, 1]
+    rho = np.sqrt(x**2 + y**2)
+    phi = np.degrees(np.arctan2(y,x))
+    return np.vstack((rho, phi)).T  
+
+def lidar2cam(args, camera, lidar, camera_bp, world, background_data):
+    """
+    This function is intended to be a tutorial on how to retrieve data in a
+    synchronous way, and project 3D points from a lidar to a 2D camera.
+    """
+    try:
+        # Build the K projection matrix:
+        # K = [[Fx,  0, image_w/2],
+        #      [ 0, Fy, image_h/2],
+        #      [ 0,  0,         1]]
+        image_w = camera_bp.get_attribute("image_size_x").as_int()
+        image_h = camera_bp.get_attribute("image_size_y").as_int()
+        fov = camera_bp.get_attribute("fov").as_float()
+        focal = image_w / (2.0 * np.tan(fov * np.pi / 360.0))
+
+        # In this case Fx and Fy are the same since the pixel aspect
+        # ratio is 1
+        K = np.identity(3)
+        K[0, 0] = K[1, 1] = focal
+        K[0, 2] = image_w / 2.0
+        K[1, 2] = image_h / 2.0
+        # print(f'K={K}')
+        # The sensor data will be saved in thread-safe Queues
+        image_queue = Queue()
+        lidar_queue = Queue()
+
+        camera.listen(lambda data: sensor_callback(data, image_queue))
+        lidar.listen(lambda data: sensor_callback(data, lidar_queue))
+
+        for frame in range(args.frames):
+            world.tick()
+            world_frame = world.get_snapshot().frame
+
+            try:
+                # Get the data once it's received.
+                image_data = image_queue.get(True, 1.0)
+                lidar_data = lidar_queue.get(True, 1.0)
+            except Empty:
+                print("[Warning] Some sensor data has been missed")
+                continue
+            print(f'lidar frame: {lidar_data.frame}, image frame: {image_data.frame}, world frame: {world_frame}')
+            # assert image_data.frame == lidar_data.frame == world_frame
+            # At this point, we have the synchronized information from the 2 sensors.
+            sys.stdout.write("\r(%d/%d) Simulation: %d Camera: %d Lidar: %d" %
+                (frame, args.frames, world_frame, image_data.frame, lidar_data.frame) + ' \n')
+            # sys.stdout.flush()
+
+            # Get the raw BGRA buffer and convert it to an array of RGB of
+            # shape (image_data.height, image_data.width, 3).
+            im_array = np.copy(np.frombuffer(image_data.raw_data, dtype=np.dtype("uint8")))
+            im_array = np.reshape(im_array, (image_data.height, image_data.width, 4))
+            im_array = im_array[:, :, :3][:, :, ::-1]
+
+            # Get the lidar data and convert it to a numpy array.
+            p_cloud_size = len(lidar_data)
+            p_cloud = np.copy(np.frombuffer(lidar_data.raw_data, dtype=np.dtype('f4')))
+            p_cloud = np.reshape(p_cloud, (p_cloud_size, 4))
+
+            # Lidar intensity array of shape (p_cloud_size,) but, for now, let's
+            # focus on the 3D points.
+            intensity = np.array(p_cloud[:, 3])
+
+            # Point cloud in lidar sensor space array of shape (3, p_cloud_size).
+            local_lidar_points = np.array(p_cloud[:, :-1]).T
+            local_lidar_points[:, :1] = -local_lidar_points[:, :1]
+            # print(local_lidar_points)
+            # print(points.shape)
+            # d, i = background_data.query(points)
+            # filtermask = d > 0.2
+            # filtered_points = points[filtermask]
+            # polar_points = transform_polar(filtered_points)
+            # polar_points = np.append(polar_points,np.expand_dims(filtered_points[:,2], axis=1), 1)
+            # polar_points[:, 1] *= 0.05
+            # polar_points[:, 2] *= 0.6
+            # if points[filtermask].shape[0] > 0:
+            #     local_lidar_points = (np.array(p_cloud[:, :3])[filtermask]).T
+            #     intensity = intensity[filtermask]
+            # else:
+            #     local_lidar_points = np.array([[0], [0], [0]])
+            #     intensity = np.array([0])
+
+            # Add an extra 1.0 at the end of each 3d point so it becomes of
+            # shape (4, p_cloud_size) and it can be multiplied by a (4, 4) matrix.
+            local_lidar_points = np.r_[
+                local_lidar_points, [np.ones(local_lidar_points.shape[1])]]
+            # print(local_lidar_points.shape)
+            # This (4, 4) matrix transforms the points from lidar space to world space.
+            lidar_2_world = lidar.get_transform().get_matrix()
+            # print(lidar_2_world)
+            # Transform the points from lidar space to world space.
+            world_points = np.dot(lidar_2_world, local_lidar_points)
+            # print(world_points)
+            # This (4, 4) matrix transforms the points from world to sensor coordinates.
+            world_2_camera = np.array(camera.get_transform().get_inverse_matrix())
+
+            # Transform the points from world space to camera space.
+            sensor_points = np.dot(world_2_camera, world_points)
+
+            # Now we must change from UE4's coordinate system to an "standard"
+            # camera coordinate system (the same used by OpenCV):
+
+            # ^ z                       . z
+            # |                        /
+            # |              to:      +-------> x
+            # | . x                   |
+            # |/                      |
+            # +-------> y             v y
+
+            # This can be achieved by multiplying by the following matrix:
+            # [[ 0,  1,  0 ],
+            #  [ 0,  0, -1 ],
+            #  [ 1,  0,  0 ]]
+
+            # Or, in this case, is the same as swapping:
+            # (x, y ,z) -> (y, -z, x)
+            point_in_camera_coords = np.array([
+                sensor_points[1],
+                sensor_points[2] * -1,
+                sensor_points[0]])
+
+            # Finally we can use our K matrix to do the actual 3D -> 2D.
+            points_2d = np.dot(K, point_in_camera_coords)
+
+            # Remember to normalize the x, y values by the 3rd value.
+            points_2d = np.array([
+                points_2d[0, :] / points_2d[2, :],
+                points_2d[1, :] / points_2d[2, :],
+                points_2d[2, :]])
+
+            # At this point, points_2d[0, :] contains all the x and points_2d[1, :]
+            # contains all the y values of our points. In order to properly
+            # visualize everything on a screen, the points that are out of the screen
+            # must be discarted, the same with points behind the camera projection plane.
+            points_2d = points_2d.T
+            intensity = intensity.T
+            points_in_canvas_mask = \
+                (points_2d[:, 0] > 0.0) & (points_2d[:, 0] < image_w) & \
+                (points_2d[:, 1] > 0.0) & (points_2d[:, 1] < image_h) & \
+                (points_2d[:, 2] > 0.0)
+            points_2d = points_2d[points_in_canvas_mask]
+            intensity = intensity[points_in_canvas_mask]
+
+            # Extract the screen coords (uv) as integers.
+            u_coord = points_2d[:, 0].astype(np.int)
+            v_coord = points_2d[:, 1].astype(np.int)
+
+            # Since at the time of the creation of this script, the intensity function
+            # is returning high values, these are adjusted to be nicely visualized.
+            intensity = 4 * intensity - 3
+            color_map = np.array([
+                np.interp(intensity, VID_RANGE, VIRIDIS[:, 0]) * 255.0,
+                np.interp(intensity, VID_RANGE, VIRIDIS[:, 1]) * 255.0,
+                np.interp(intensity, VID_RANGE, VIRIDIS[:, 2]) * 255.0]).astype(np.int).T
+
+            if args.dot_extent <= 0:
+                # Draw the 2d points on the image as a single pixel using numpy.
+                im_array[v_coord, u_coord] = color_map
+            else:
+                # Draw the 2d points on the image as squares of extent args.dot_extent.
+                for i in range(len(points_2d)):
+                    # I'm not a NumPy expert and I don't know how to set bigger dots
+                    # without using this loop, so if anyone has a better solution,
+                    # make sure to update this script. Meanwhile, it's fast enough :)
+                    im_array[
+                        v_coord[i]-args.dot_extent : v_coord[i]+args.dot_extent,
+                        u_coord[i]-args.dot_extent : u_coord[i]+args.dot_extent] = color_map[i]
+
+            # Save the image using Pillow module.
+            image = Image.fromarray(im_array)
+            image.save("_out/%08d.png" % image_data.frame)
+
+    finally:
+        # Apply the original settings when exiting.
+        world.apply_settings(original_settings)
+
+        # Destroy the actors in the scene.
+        if camera:
+            camera.destroy()
+        if lidar:
+            lidar.destroy()
 def process_background(data):
     # points = data[:, :-1]
     background_data = cKDTree(data)
     return background_data
+def main(args):
 
-def main(arg):
-    """Main function of the script"""
-    client = carla.Client(arg.host, arg.port)
-    client.set_timeout(10.0)
-    client.load_world('Town05')
-    client.reload_world()
-    world = client.get_world()
+    args.width, args.height = [int(x) for x in args.res.split('x')]
+    args.dot_extent -= 1
     data = np.genfromtxt('background.csv', delimiter=',')
     print('loading background data, size: {}'.format(data.shape))
     background_data = process_background(data)
+
     try:
-        original_settings = world.get_settings()
-        settings = world.get_settings()
-        traffic_manager = client.get_trafficmanager(8000)
-        traffic_manager.set_synchronous_mode(True)
+        client, camera, lidar, camera_bp, lidar_bp, world = setup_world(args)
+        lidar2cam(args, camera, lidar, camera_bp, world, background_data)
 
-        delta = 0.05
+    except KeyboardInterrupt:
+        print('\nCancelled by user. Bye!')
 
-        settings.fixed_delta_seconds = delta
-        settings.synchronous_mode = True
-        settings.no_rendering_mode = arg.no_rendering
-        world.apply_settings(settings)
 
-        blueprint_library = world.get_blueprint_library()
-        # vehicle_bp = blueprint_library.filter(arg.filter)[0]
-        # vehicle_transform = random.choice(world.get_map().get_spawn_points())
-        # vehicle = world.spawn_actor(vehicle_bp, vehicle_transform)
-        # vehicle.set_autopilot(arg.no_autopilot)
-
-        camera_bp = world.get_blueprint_library().find('sensor.camera.rgb')
-        camera_bp.set_attribute('image_size_x', str(IM_WIDTH))
-        camera_bp.set_attribute('image_size_y', str(IM_HEIGHT))
-        camera_bp.set_attribute('fov', '110')
-        camera_transform = carla.Transform(carla.Location(x=-65.0, y=3.0, z=6.0), carla.Rotation(yaw=180.0, pitch=-30.0))
-        camera = world.spawn_actor(camera_bp, camera_transform)
-        camera.listen(processImg)
-        _, PLT_IMG_AX = plt.subplots(1)
-        # ani = FuncAnimation(plt.gcf(), imgUpdate, interval=50)
-        # plt.show()
-        lidar_bp = generate_lidar_bp(arg, world, blueprint_library, delta)
-        lidar_transform = carla.Transform(carla.Location(x=-65.0, y=3.0, z=6.0))
-        lidar = world.spawn_actor(lidar_bp, lidar_transform)
-
-        fig = mlab.figure(size=(960,540), bgcolor=(0.05,0.05,0.05))
-        vis = mlab.points3d(0, 0, 0, 0, mode='point', figure=fig)
-        mlab.view(distance=25)
-        buf = {'pts': np.zeros((1,3)), 'intensity':np.zeros(1)}
-
-        #  @mlab.animate(delay=100)
-        def anim():
-            i=0
-            while True:
-                vis.mlab_source.reset(x=buf['pts'][:,0], y=buf['pts'][:,1], z=buf['pts'][:,2], scalars=buf['intensity'])
-                mlab.savefig(f'{i%10}.png', figure=fig)
-                time.sleep(0.1)
-                i+=1
-
-        if arg.semantic:
-            lidar.listen(lambda data: semantic_lidar_callback(data, buf, background_data))
-        else:
-            lidar.listen(lambda data: lidar_callback(data, buf, background_data))
-
-        loopThread = threading.Thread(target=carlaEventLoop, args=[world], daemon=True)
-        loopThread.start()
-        anim()
-        #  mlab.show()
-
-    finally:
-        world.apply_settings(original_settings)
-        traffic_manager.set_synchronous_mode(False)
-
-        vehicle.destroy()
-        lidar.destroy()
-
-if __name__ == "__main__":
+if __name__ == '__main__':
+    """Start function"""
     argparser = argparse.ArgumentParser(
-        description=__doc__)
+        description='CARLA Sensor sync and projection tutorial')
     argparser.add_argument(
         '--host',
         metavar='H',
-        default='localhost',
-        help='IP of the host CARLA Simulator (default: localhost)')
+        default='127.0.0.1',
+        help='IP of the host server (default: 127.0.0.1)')
     argparser.add_argument(
         '-p', '--port',
         metavar='P',
         default=2000,
         type=int,
-        help='TCP port of CARLA Simulator (default: 2000)')
+        help='TCP port to listen to (default: 2000)')
     argparser.add_argument(
-        '--no-rendering',
-        action='store_true',
-        help='use the no-rendering mode which will provide some extra'
-        ' performance but you will lose the articulated objects in the'
-        ' lidar, such as pedestrians')
+        '--res',
+        metavar='WIDTHxHEIGHT',
+        default='1920x1080',
+        help='window resolution (default: 1280x720)')
     argparser.add_argument(
-        '--semantic',
-        action='store_true',
-        help='use the semantic lidar instead, which provides ground truth'
-        ' information')
+        '-f', '--frames',
+        metavar='N',
+        default=500,
+        type=int,
+        help='number of frames to record (default: 500)')
+    argparser.add_argument(
+        '-d', '--dot-extent',
+        metavar='SIZE',
+        default=4,
+        type=int,
+        help='visualization dot extent in pixels (Recomended [1-4]) (default: 2)')
     argparser.add_argument(
         '--no-noise',
         action='store_true',
         help='remove the drop off and noise from the normal (non-semantic) lidar')
     argparser.add_argument(
-        '--no-autopilot',
-        action='store_false',
-        help='disables the autopilot so the vehicle will remain stopped')
-    argparser.add_argument(
-        '--show-axis',
-        action='store_true',
-        help='show the cartesian coordinates axis')
-    argparser.add_argument(
-        '--filter',
-        metavar='PATTERN',
-        default='model3',
-        help='actor filter (default: "vehicle.*")')
-    argparser.add_argument(
         '--upper-fov',
+        metavar='F',
         default=15.0,
         type=float,
         help='lidar\'s upper field of view in degrees (default: 15.0)')
     argparser.add_argument(
         '--lower-fov',
+        metavar='F',
         default=-85.0,
         type=float,
         help='lidar\'s lower field of view in degrees (default: -25.0)')
     argparser.add_argument(
-        '--channels',
+        '-c', '--channels',
+        metavar='C',
         default=160.0,
         type=float,
         help='lidar\'s channel count (default: 64)')
     argparser.add_argument(
-        '--range',
+        '-r', '--range',
+        metavar='R',
         default=100.0,
         type=float,
         help='lidar\'s maximum range in meters (default: 100.0)')
     argparser.add_argument(
         '--points-per-second',
-        default=1000000,
+        metavar='N',
+        default='1000000',
         type=int,
-        help='lidar\'s points per second (default: 500000)')
-    argparser.add_argument(
-        '-x',
-        default=0.0,
-        type=float,
-        help='offset in the sensor position in the X-axis in meters (default: 0.0)')
-    argparser.add_argument(
-        '-y',
-        default=0.0,
-        type=float,
-        help='offset in the sensor position in the Y-axis in meters (default: 0.0)')
-    argparser.add_argument(
-        '-z',
-        default=0.0,
-        type=float,
-        help='offset in the sensor position in the Z-axis in meters (default: 0.0)')
+        help='lidar points per second (default: 1000000)')
     args = argparser.parse_args()
-
-    try:
-        main(args)
-    except KeyboardInterrupt:
-        print(' - Exited by user.')
+    main(args)
